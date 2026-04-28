@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from datafinder.schema import DatasetHit, ToolCall
@@ -90,17 +90,29 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 class ToolRunner:
     """Maps tool name + args to a Store call. Records every dispatch
-    as a ToolCall so the agent run is fully audited."""
+    as a ToolCall so the agent run is fully audited.
 
-    def __init__(self, store: Store) -> None:
+    If `on_event` is supplied, fires `tool_call` before dispatch and
+    `tool_result` after, so streaming consumers (the SSE endpoint)
+    render the trace live."""
+
+    def __init__(
+        self,
+        store: Store,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.store = store
         self._calls: list[ToolCall] = []
+        self._on_event = on_event
 
     @property
     def calls(self) -> list[ToolCall]:
         return list(self._calls)
 
     def dispatch(self, name: str, args: dict[str, Any]) -> str:
+        idx = len(self._calls)
+        if self._on_event is not None:
+            self._on_event({"type": "tool_call", "idx": idx, "tool": name, "args": args})
         t0 = time.perf_counter()
         if name == "semantic_search":
             hits = self.store.semantic_search(
@@ -138,13 +150,19 @@ class ToolRunner:
             result = json.dumps({"error": f"unknown tool: {name}"})
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        summary = _truncate(result, 800)
         self._calls.append(ToolCall(
-            idx=len(self._calls),
+            idx=idx,
             tool=name,
             args=args,
-            result_summary=_truncate(result, 800),
+            result_summary=summary,
             elapsed_ms=elapsed_ms,
         ))
+        if self._on_event is not None:
+            self._on_event({
+                "type": "tool_result", "idx": idx,
+                "summary": summary, "elapsed_ms": elapsed_ms,
+            })
         return result
 
 

@@ -26,20 +26,84 @@ function el(t, a = {}, ...c) {
 
 async function ask() {
   if (!state.query.trim() || state.busy) return;
-  state.busy = true; state.error = ""; state.run = null; render();
+  state.busy = true; state.error = ""; render();
+  // Initial scaffold; streaming events fill it in as they arrive.
+  const live = {
+    id: "live", query: state.query, route: "—",
+    normalized: { raw: state.query, text: state.query, hints: {} },
+    answer: "", citations: [], grounded: false, refinements: 0,
+    tool_calls: [],
+  };
+  state.run = live;
   try {
-    const r = await fetch("/v1/ask", {
+    const r = await fetch("/v1/ask/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query: state.query }),
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    state.run = await r.json();
+    if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        applyFrame(frame, live);
+      }
+    }
   } catch (e) {
     state.error = e.message;
   } finally {
     state.busy = false; render();
   }
+}
+
+function applyFrame(frame, run) {
+  let event = "message"; let data = "";
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data = line.slice(5).trim();
+  }
+  if (!data) return;
+  let d; try { d = JSON.parse(data); } catch { return; }
+  switch (event) {
+    case "normalize":
+      run.normalized = { raw: d.raw, text: d.text, hints: d.hints || {} };
+      break;
+    case "route":
+      run.route = d.route;
+      break;
+    case "tool_call":
+      run.tool_calls.push({
+        idx: d.idx, tool: d.tool, args: d.args,
+        result_summary: "(running…)", elapsed_ms: 0,
+      });
+      break;
+    case "tool_result": {
+      const tc = run.tool_calls.find((c) => c.idx === d.idx);
+      if (tc) { tc.result_summary = d.summary; tc.elapsed_ms = d.elapsed_ms; }
+      break;
+    }
+    case "refine":
+      run.refinements = d.attempt;
+      break;
+    case "answer":
+      run.answer = d.content;
+      run.citations = d.citations || [];
+      break;
+    case "done":
+      run.id = d.run_id;
+      run.grounded = d.grounded;
+      run.refinements = d.refinements;
+      break;
+    default: break;
+  }
+  render();
 }
 
 function render() {

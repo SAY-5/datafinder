@@ -57,7 +57,33 @@ class Agent:
     def run(self, query: str, session_id: str | None = None) -> AgentRun:
         nq = normalize(query)
         r = route_query(nq)
-        return self._run_with_normalized(query, nq, r, session_id)
+        return self._run_with_normalized(query, nq, r, session_id, on_event=None)
+
+    def stream(
+        self,
+        query: str,
+        session_id: str | None = None,
+    ):
+        """Generator variant. Yields decision/tool events as they
+        happen, then a final 'done' event with the AgentRun id. Same
+        underlying loop as `run`; the caller gets a live trace they
+        can render in the UI."""
+        events: list[dict[str, Any]] = []
+
+        def collect(ev: dict[str, Any]) -> None:
+            events.append(ev)
+
+        nq = normalize(query)
+        collect({"type": "normalize", "raw": nq.raw, "text": nq.text, "hints": nq.hints})
+        r = route_query(nq)
+        collect({"type": "route", "route": r})
+        run = self._run_with_normalized(query, nq, r, session_id, on_event=collect)
+        collect({"type": "answer", "content": run.answer, "citations": run.citations})
+        collect({
+            "type": "done", "run_id": run.id,
+            "grounded": run.grounded, "refinements": run.refinements,
+        })
+        yield from events
 
     def _run_with_normalized(
         self,
@@ -65,6 +91,7 @@ class Agent:
         nq: NormalizedQuery,
         route: Route,
         session_id: str | None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> AgentRun:
         run = AgentRun(
             id=f"r_{uuid.uuid4().hex[:12]}",
@@ -74,7 +101,7 @@ class Agent:
             route=route,
             started_at=datetime.now(UTC),
         )
-        runner = ToolRunner(self.store)
+        runner = ToolRunner(self.store, on_event=on_event)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": _system_message(route, nq)},
             {"role": "user", "content": nq.text},
@@ -95,6 +122,11 @@ class Agent:
                 return run
             # Refine: tighter system message + same user query.
             attempts += 1
+            if on_event is not None:
+                on_event({
+                    "type": "refine", "attempt": attempts,
+                    "reason": "answer did not cite any tool result",
+                })
             messages = [
                 {"role": "system", "content": _refinement_system(route, nq, attempts)},
                 {"role": "user", "content": nq.text},

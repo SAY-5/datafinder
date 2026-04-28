@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json as _json
 import os
+from collections.abc import Iterator
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from datafinder.agent import Agent, AgentConfig, ChatClient, FakeChatClient
@@ -78,6 +80,28 @@ def build_app(
         run: AgentRun = agent.run(body.query, session_id=body.session_id)
         state["runs"][run.id] = run
         return run.model_dump(mode="json")
+
+    @app.post("/v1/ask/stream")
+    def ask_stream(body: AskBody) -> StreamingResponse:
+        """Same as /v1/ask but streams every decision and tool round-
+        trip as it happens (Server-Sent Events). The UI renders the
+        trace live instead of waiting for the full run."""
+        agent = Agent(
+            store=state["store"],
+            chat=state["chat"],
+            config=state["config"],
+        )
+
+        def gen() -> Iterator[bytes]:
+            for ev in agent.stream(body.query, session_id=body.session_id):
+                yield _sse(ev["type"], ev)
+            yield b"event: end\ndata: {}\n\n"
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/v1/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
@@ -164,6 +188,11 @@ class _StubChatClient:
                 "content": f"Top match: {top}. See dataset preview for details.",
             }}]}
         return {"choices": [{"message": {"role": "assistant", "content": "No matching dataset."}}]}
+
+
+def _sse(event: str, data: dict[str, Any]) -> bytes:
+    """Encode a single SSE frame: `event: NAME\\ndata: <json>\\n\\n`."""
+    return f"event: {event}\ndata: {_json.dumps(data, default=str)}\n\n".encode()
 
 
 def _last_user(messages: list[dict[str, Any]]) -> str:
