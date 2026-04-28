@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: datafinder
+      POSTGRES_USER: datafinder
+      POSTGRES_PASSWORD: datafinder
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datafinder"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports: ["5434:5432"]
+
+  datafinder:
+    build: .
+    environment:
+      DATAFINDER_PG_DSN: postgresql://datafinder:datafinder@postgres:5432/datafinder
+      DATAFINDER_MODEL: ${DATAFINDER_MODEL:-gpt-4o-mini}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["8000:8000"]
+
+volumes:
+  pgdata:
