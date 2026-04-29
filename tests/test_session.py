@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC
+
 from fastapi.testclient import TestClient
 
 from datafinder.agent import Agent, AgentConfig, FakeChatClient, fake_final, fake_tool_call
@@ -53,8 +55,9 @@ def test_history_isolated_per_session():
 def test_history_bounded_by_max_session_turns():
     a = _agent([], max_session_turns=2)
     # Inject 4 prior runs into the session.
+    from datetime import datetime
+
     from datafinder.schema import AgentRun, NormalizedQuery
-    from datetime import datetime, timezone
     for i in range(4):
         a.sessions.setdefault("s1", []).append(AgentRun(
             id=f"r_{i}",
@@ -67,7 +70,7 @@ def test_history_bounded_by_max_session_turns():
             grounded=True,
             refinements=0,
             tool_calls=[],
-            started_at=datetime.now(timezone.utc),
+            started_at=datetime.now(UTC),
         ))
     # The system message renderer trims to last 2; verify by grepping
     # the system prompt the agent would build.
@@ -87,7 +90,6 @@ def test_system_message_includes_prior_q_a_and_citations():
     a.run("knee MRI cohort", session_id="s1")
 
     # Capture what the second turn sends as the system message.
-    captured: list[list[dict]] = []
     chat = FakeChatClient(responses=[fake_final("ds_adni")])
     a.chat = chat
     a.run("any brain MRI alternatives?", session_id="s1")
