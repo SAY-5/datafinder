@@ -58,6 +58,10 @@ class ToolCall(BaseModel):
     args: dict[str, Any]
     result_summary: str
     elapsed_ms: int = 0
+    # Dataset IDs the tool returned. Recorded separately from
+    # result_summary so the grounding/citation logic doesn't have to
+    # parse a possibly-truncated JSON blob.
+    cited_ids: list[str] = Field(default_factory=list)
 
 
 class AgentRun(BaseModel):

@@ -70,27 +70,52 @@ def build_app(
             raise HTTPException(404, "dataset not found")
         return d.model_dump()
 
+    def _shared_agent() -> Agent:
+        """v3: persist one Agent across requests so its per-session
+        conversation memory accumulates across /v1/ask calls."""
+        agent = state.get("agent")
+        if agent is None:
+            agent = Agent(
+                store=state["store"],
+                chat=state["chat"],
+                config=state["config"],
+            )
+            state["agent"] = agent
+        return agent
+
     @app.post("/v1/ask")
     def ask(body: AskBody) -> dict[str, Any]:
-        agent = Agent(
-            store=state["store"],
-            chat=state["chat"],
-            config=state["config"],
-        )
+        agent = _shared_agent()
         run: AgentRun = agent.run(body.query, session_id=body.session_id)
         state["runs"][run.id] = run
         return run.model_dump(mode="json")
+
+    @app.get("/v1/sessions/{session_id}")
+    def get_session(session_id: str) -> dict[str, Any]:
+        """v3: per-session conversation history. Returns prior turns
+        in chronological order so a UI can render the timeline + show
+        the cumulative citations across the session."""
+        agent = state.get("agent")
+        if agent is None:
+            return {"session_id": session_id, "turns": [], "citations": []}
+        runs = agent.history(session_id)
+        all_citations: list[str] = []
+        for r in runs:
+            for c in r.citations:
+                if c not in all_citations:
+                    all_citations.append(c)
+        return {
+            "session_id": session_id,
+            "turns": [r.model_dump(mode="json") for r in runs],
+            "citations": all_citations,
+        }
 
     @app.post("/v1/ask/stream")
     def ask_stream(body: AskBody) -> StreamingResponse:
         """Same as /v1/ask but streams every decision and tool round-
         trip as it happens (Server-Sent Events). The UI renders the
         trace live instead of waiting for the full run."""
-        agent = Agent(
-            store=state["store"],
-            chat=state["chat"],
-            config=state["config"],
-        )
+        agent = _shared_agent()
 
         def gen() -> Iterator[bytes]:
             for ev in agent.stream(body.query, session_id=body.session_id):

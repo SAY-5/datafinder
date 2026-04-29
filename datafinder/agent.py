@@ -46,6 +46,10 @@ class AgentConfig:
     model: str = DEFAULT_MODEL
     max_tool_rounds: int = 6
     max_refinements: int = 2
+    # v3: how many prior turns of a session to fold into the system
+    # prompt. Conversational refinements ("now narrow to age 60+")
+    # only work when the agent sees the prior question + answer.
+    max_session_turns: int = 6
 
 
 @dataclass
@@ -53,11 +57,22 @@ class Agent:
     store: Store
     chat: ChatClient
     config: AgentConfig = field(default_factory=AgentConfig)
+    # v3: per-session conversation memory. Keyed by session_id; each
+    # value is the list of prior AgentRun objects in chronological
+    # order. Bounded to `config.max_session_turns` so the prompt
+    # doesn't grow unboundedly. In production this lives in Postgres
+    # alongside agent_runs; in-memory is fine for single-process
+    # demos and tests.
+    sessions: dict[str, list[AgentRun]] = field(default_factory=dict)
 
     def run(self, query: str, session_id: str | None = None) -> AgentRun:
         nq = normalize(query)
         r = route_query(nq)
         return self._run_with_normalized(query, nq, r, session_id, on_event=None)
+
+    def history(self, session_id: str) -> list[AgentRun]:
+        """Read-only snapshot of the session's prior runs in order."""
+        return list(self.sessions.get(session_id, []))
 
     def stream(
         self,
@@ -102,8 +117,16 @@ class Agent:
             started_at=datetime.now(UTC),
         )
         runner = ToolRunner(self.store, on_event=on_event)
+        # v3: prepend a conversation-history block to the system
+        # message so follow-up queries ("now narrow to age 60+") have
+        # the prior turn's question + answer + chosen route as context.
+        # Bounded to max_session_turns to keep the prompt size sane.
+        history = []
+        if session_id is not None:
+            history = self.sessions.get(session_id, [])
+            history = history[-self.config.max_session_turns:]
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _system_message(route, nq)},
+            {"role": "system", "content": _system_message(route, nq, history)},
             {"role": "user", "content": nq.text},
         ]
 
@@ -119,6 +142,10 @@ class Agent:
                 run.refinements = attempts
                 run.tool_calls = runner.calls
                 run.ended_at = datetime.now(UTC)
+                # v3: append to session history before returning so
+                # the next turn sees this one in its system prompt.
+                if session_id is not None:
+                    self.sessions.setdefault(session_id, []).append(run)
                 return run
             # Refine: tighter system message + same user query.
             attempts += 1
@@ -154,22 +181,18 @@ class Agent:
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
                 content = (msg.get("content") or "").strip()
-                # Citations: every dataset_id that appeared in any
-                # tool result is a possible citation; the model is
-                # encouraged to mention them by id in its answer.
+                # Citations: every dataset_id any tool returned is a
+                # candidate; we keep the ones the model actually
+                # mentions by id. cited_ids is populated at dispatch
+                # time on the FULL (pre-truncation) result, so we
+                # don't miss tail hits.
                 for tc in runner.calls:
-                    if tc.tool in ("semantic_search", "metadata_filter"):
-                        try:
-                            payload = json.loads(tc.result_summary.rstrip("…"))
-                        except json.JSONDecodeError:
-                            continue
-                        for h in payload.get("hits", []):
-                            did = h.get("dataset_id", "")
-                            if did and did in content:
-                                cited.add(did)
-                    elif tc.tool == "dataset_preview":
-                        did = tc.args.get("dataset_id")
+                    for did in tc.cited_ids:
                         if did and did in content:
+                            cited.add(did)
+                    if tc.tool == "dataset_preview":
+                        did = tc.args.get("dataset_id")
+                        if isinstance(did, str) and did and did in content:
                             cited.add(did)
                 return content, sorted(cited)
 
@@ -207,7 +230,11 @@ _BASE_SYSTEM = (
 )
 
 
-def _system_message(route: Route, nq: NormalizedQuery) -> str:
+def _system_message(
+    route: Route,
+    nq: NormalizedQuery,
+    history: list[AgentRun] | None = None,
+) -> str:
     hint_block = ""
     if nq.hints:
         hint_block = (
@@ -217,11 +244,24 @@ def _system_message(route: Route, nq: NormalizedQuery) -> str:
         )
     route_block = {
         "semantic":     "Start with semantic_search. Use metadata_filter only if you need to disambiguate.",
-        "metadata":     "Start with metadata_filter. Use semantic_search only if metadata returns ≥3 candidates.",
+        "metadata":     "Start with metadata_filter. Use semantic_search only if metadata returns >=3 candidates.",
         "hybrid":       "Call metadata_filter first to narrow the candidate set, then semantic_search to rank.",
         "preview_only": "The user referenced a dataset by id. Call dataset_preview directly.",
     }[route]
-    return _BASE_SYSTEM + "\n\n" + route_block + hint_block
+    history_block = ""
+    if history:
+        # v3: prior turns. The model uses these to interpret follow-
+        # up queries ("now narrow to 60+", "any others?"). Bounded by
+        # the caller (max_session_turns) so this can't explode.
+        lines = ["", "Prior turns in this session (oldest first):"]
+        for h in history:
+            lines.append(f"- Q: {h.query}")
+            answer = (h.answer or "").strip().splitlines()
+            lines.append(f"  A: {answer[0] if answer else ''}")
+            if h.citations:
+                lines.append(f"  cited: {', '.join(h.citations)}")
+        history_block = "\n".join(lines)
+    return _BASE_SYSTEM + "\n\n" + route_block + hint_block + history_block
 
 
 def _refinement_system(route: Route, nq: NormalizedQuery, attempt: int) -> str:
@@ -235,23 +275,16 @@ def _refinement_system(route: Route, nq: NormalizedQuery, attempt: int) -> str:
 
 def _is_grounded(answer: str, runner: ToolRunner) -> bool:
     """An answer is grounded if it references at least one dataset id
-    that appeared in some tool result. The agent is instructed to
-    cite by id; if it didn't, retry with a tighter system message."""
+    that appeared in some tool result. cited_ids is recorded on each
+    ToolCall at dispatch time (pre-truncation), so we don't miss tail
+    hits when result_summary gets clipped."""
     if not answer or answer.startswith("(agent:"):
         return False
     seen: set[str] = set()
     for tc in runner.calls:
+        seen.update(tc.cited_ids)
         if tc.tool == "dataset_preview":
             did = tc.args.get("dataset_id")
-            if isinstance(did, str):
-                seen.add(did)
-            continue
-        try:
-            payload = json.loads(tc.result_summary.rstrip("…"))
-        except json.JSONDecodeError:
-            continue
-        for h in payload.get("hits", []):
-            did = h.get("dataset_id")
             if isinstance(did, str):
                 seen.add(did)
     return any(did in answer for did in seen)

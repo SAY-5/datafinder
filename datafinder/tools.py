@@ -151,12 +151,28 @@ class ToolRunner:
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         summary = _truncate(result, 800)
+        # Pull dataset_ids out of the FULL result (before truncation)
+        # so the citation/grounding logic doesn't lose tail hits when
+        # the prompt-trim chops off the JSON mid-string.
+        cited_ids: list[str] = []
+        try:
+            full = json.loads(result)
+        except json.JSONDecodeError:
+            full = {}
+        if isinstance(full, dict):
+            for h in full.get("hits", []) or []:
+                did = h.get("dataset_id") if isinstance(h, dict) else None
+                if isinstance(did, str) and did:
+                    cited_ids.append(did)
+            if isinstance(full.get("id"), str):
+                cited_ids.append(full["id"])
         self._calls.append(ToolCall(
             idx=idx,
             tool=name,
             args=args,
             result_summary=summary,
             elapsed_ms=elapsed_ms,
+            cited_ids=cited_ids,
         ))
         if self._on_event is not None:
             self._on_event({
